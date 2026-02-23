@@ -1,0 +1,154 @@
+name: 'VaultSpectre Scan'
+description: 'Scan repositories for Vault secret references and validate them against a Vault instance'
+author: 'ppiankov'
+
+branding:
+  icon: 'shield'
+  color: 'purple'
+
+inputs:
+  vault-addr:
+    description: 'Vault server address'
+    required: true
+  token:
+    description: 'Vault authentication token'
+    required: true
+  repo-path:
+    description: 'Path to repository to scan'
+    required: false
+    default: '.'
+  format:
+    description: 'Output format: text, json, sarif, or spectrehub'
+    required: false
+    default: 'text'
+  fail-on-missing:
+    description: 'Exit with error if missing secrets found'
+    required: false
+    default: 'false'
+  stale-days:
+    description: 'Days threshold for stale secret detection (0 to disable)'
+    required: false
+    default: '90'
+  baseline:
+    description: 'Path to baseline file for suppressing known findings'
+    required: false
+    default: ''
+  version:
+    description: 'VaultSpectre version to use (e.g., 0.3.0). Defaults to latest.'
+    required: false
+    default: 'latest'
+  args:
+    description: 'Additional arguments to pass to vaultspectre scan'
+    required: false
+    default: ''
+  upload-sarif:
+    description: 'Upload SARIF results to GitHub Security tab (requires format=sarif)'
+    required: false
+    default: 'false'
+
+outputs:
+  exit-code:
+    description: 'Exit code from vaultspectre scan'
+    value: ${{ steps.scan.outputs.exit-code }}
+  report-path:
+    description: 'Path to the generated report file'
+    value: ${{ steps.scan.outputs.report-path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Determine version
+      id: version
+      shell: bash
+      run: |
+        if [ "${{ inputs.version }}" = "latest" ]; then
+          VERSION=$(gh release view --repo ppiankov/vaultspectre --json tagName --jq '.tagName' | sed 's/^v//')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        else
+          echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+        fi
+      env:
+        GH_TOKEN: ${{ github.token }}
+
+    - name: Download VaultSpectre
+      shell: bash
+      run: |
+        VERSION="${{ steps.version.outputs.version }}"
+        ARCH=$(uname -m)
+        case "$ARCH" in
+          x86_64) ARCH="amd64" ;;
+          aarch64|arm64) ARCH="arm64" ;;
+        esac
+        OS="linux"
+
+        ASSET="vaultspectre_${VERSION}_${OS}_${ARCH}.tar.gz"
+        URL="https://github.com/ppiankov/vaultspectre/releases/download/v${VERSION}/${ASSET}"
+
+        echo "Downloading VaultSpectre ${VERSION} (${OS}/${ARCH})..."
+        curl -sSL "${URL}" -o /tmp/vaultspectre.tar.gz
+        tar -xzf /tmp/vaultspectre.tar.gz -C /tmp
+        chmod +x /tmp/vaultspectre
+        echo "/tmp" >> "$GITHUB_PATH"
+
+    - name: Run VaultSpectre scan
+      id: scan
+      shell: bash
+      run: |
+        ARGS="--repo ${{ inputs.repo-path }}"
+        ARGS="${ARGS} --vault-addr ${{ inputs.vault-addr }}"
+        ARGS="${ARGS} --token ${{ inputs.token }}"
+        ARGS="${ARGS} --output ${{ inputs.format }}"
+        ARGS="${ARGS} --stale-days ${{ inputs.stale-days }}"
+
+        if [ "${{ inputs.fail-on-missing }}" = "true" ]; then
+          ARGS="${ARGS} --fail-on-missing"
+        fi
+
+        if [ -n "${{ inputs.baseline }}" ]; then
+          ARGS="${ARGS} --baseline ${{ inputs.baseline }}"
+        fi
+
+        if [ -n "${{ inputs.args }}" ]; then
+          ARGS="${ARGS} ${{ inputs.args }}"
+        fi
+
+        REPORT_PATH=""
+        if [ "${{ inputs.format }}" = "sarif" ]; then
+          REPORT_PATH="${{ runner.temp }}/vaultspectre.sarif"
+          echo "report-path=${REPORT_PATH}" >> "$GITHUB_OUTPUT"
+          set +e
+          vaultspectre scan ${ARGS} > "${REPORT_PATH}"
+          EXIT_CODE=$?
+          set -e
+        elif [ "${{ inputs.format }}" = "json" ] || [ "${{ inputs.format }}" = "spectrehub" ]; then
+          REPORT_PATH="${{ runner.temp }}/vaultspectre.json"
+          echo "report-path=${REPORT_PATH}" >> "$GITHUB_OUTPUT"
+          set +e
+          vaultspectre scan ${ARGS} > "${REPORT_PATH}"
+          EXIT_CODE=$?
+          set -e
+        else
+          set +e
+          vaultspectre scan ${ARGS}
+          EXIT_CODE=$?
+          set -e
+        fi
+
+        echo "exit-code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+
+        if [ "${EXIT_CODE}" -eq 2 ]; then
+          echo "::error::VaultSpectre encountered a configuration or connection error (exit code 2)"
+          exit 2
+        fi
+
+        if [ "${EXIT_CODE}" -eq 1 ] && [ "${{ inputs.fail-on-missing }}" = "true" ]; then
+          echo "::warning::VaultSpectre found issues in secret references (exit code 1)"
+          exit 1
+        fi
+
+    - name: Upload SARIF
+      if: inputs.upload-sarif == 'true' && inputs.format == 'sarif' && always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ steps.scan.outputs.report-path }}
+        category: vaultspectre
